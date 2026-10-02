@@ -1,0 +1,443 @@
+use core::sync::atomic::Ordering;
+
+use embassy_futures::select::select;
+use embassy_nrf::gpio::Output;
+use embassy_nrf::saadc::Saadc;
+use embassy_time::{Duration, Instant};
+use rmk_macro::{Event, input_device};
+
+use super::{AdcState, AnalogEventType};
+use crate::event::{Axis, AxisEvent, AxisValType, BatteryAdcEvent, PointingEvent};
+use crate::input_device::joystick::{
+    IdleTracker, JOYSTICK_WAKE_EPOCH, JOYSTICK_WAKE_SIGNAL, JoystickPowerConfig, adc_axis,
+    apply_deadzone, configure_joystick_wake,
+};
+
+struct PowerSampling<'a, const N: usize> {
+    config: JoystickPowerConfig,
+    pins: [Option<Output<'a>>; N],
+    mux: Option<MuxSampling<'a, N>>,
+    bias: [[i16; 3]; N],
+    deadzones: [u16; N],
+    idle: IdleTracker,
+    next_sample: Instant,
+    battery_due: Instant,
+    last_activity: Instant,
+    wake_epoch: u32,
+    sleeping: bool,
+    boot_done: bool,
+    sample_valid: bool,
+    battery_ready: bool,
+    warned: bool,
+}
+
+struct MuxSampling<'a, const N: usize> {
+    s0: Output<'a>,
+    s1: Output<'a>,
+    settle_us: u32,
+    channels: [u8; 4],
+    /// One result per joystick axis, indexed by event slot.
+    axes: [[i16; 3]; N],
+}
+
+/// A cancelled sampling future must not leave a switched joystick powered.
+struct SupplyGuard<'s, 'a, const N: usize> {
+    pins: &'s mut [Option<Output<'a>>; N],
+}
+
+impl<const N: usize> Drop for SupplyGuard<'_, '_, N> {
+    fn drop(&mut self) {
+        for pin in self.pins.iter_mut().flatten() {
+            pin.set_low();
+        }
+    }
+}
+
+/// Events produced by NrfAdc.
+#[derive(Event, Clone, Debug)]
+pub enum NrfAdcEvent {
+    Pointing(PointingEvent),
+    Battery(BatteryAdcEvent),
+}
+
+#[input_device(publish = NrfAdcEvent)]
+pub struct NrfAdc<'a, const PIN_NUM: usize, const EVENT_NUM: usize> {
+    saadc: Saadc<'a, PIN_NUM>,
+    polling_interval: Duration,
+    light_sleep: Option<Duration>,
+    buf: [[i16; PIN_NUM]; 2],
+    event_type: [AnalogEventType; EVENT_NUM],
+    /// Device id emitted in PointingEvent for each event slot.
+    /// Indexed by event_state; irrelevant for Battery slots (use 0).
+    event_device_ids: [u8; EVENT_NUM],
+    event_state: u8,
+    channel_state: u8,
+    buf_state: bool,
+    adc_state: AdcState,
+    active_instant: Instant,
+    power: Option<PowerSampling<'a, EVENT_NUM>>,
+}
+
+impl<'a, const PIN_NUM: usize, const EVENT_NUM: usize> NrfAdc<'a, PIN_NUM, EVENT_NUM> {
+    pub fn new(
+        saadc: Saadc<'a, PIN_NUM>,
+        event_type: [AnalogEventType; EVENT_NUM],
+        event_device_ids: [u8; EVENT_NUM],
+        polling_interval: Duration,
+        light_sleep: Option<Duration>,
+    ) -> Self {
+        Self {
+            saadc,
+            polling_interval,
+            event_type,
+            event_device_ids,
+            light_sleep,
+            buf: [[0; PIN_NUM]; 2],
+            event_state: 0,
+            channel_state: 0,
+            buf_state: false,
+            adc_state: AdcState::LightSleep,
+            active_instant: Instant::MIN,
+            power: None,
+        }
+    }
+
+    pub fn with_power_management(
+        mut self,
+        config: JoystickPowerConfig,
+        pins: [Option<Output<'a>>; EVENT_NUM],
+        bias: [[i16; 3]; EVENT_NUM],
+        deadzones: [u16; EVENT_NUM],
+    ) -> Self {
+        assert!(config.sleep_after_ms == 0 || config.wake_device_id.is_some());
+        configure_joystick_wake((config.sleep_after_ms > 0).then_some(config.wake_device_id).flatten());
+        self.power = Some(PowerSampling {
+            config,
+            pins,
+            mux: None,
+            bias,
+            deadzones,
+            idle: IdleTracker::default(),
+            next_sample: Instant::MIN,
+            battery_due: Instant::MIN,
+            last_activity: Instant::now(),
+            wake_epoch: JOYSTICK_WAKE_EPOCH.load(Ordering::Acquire),
+            sleeping: false,
+            boot_done: false,
+            sample_valid: false,
+            battery_ready: false,
+            warned: false,
+        });
+        self.event_state = EVENT_NUM as u8;
+        self
+    }
+
+    pub fn with_mux_select(mut self, s0: Output<'a>, s1: Output<'a>, settle_us: u32, channels: [u8; 4]) -> Self {
+        self.power.as_mut().expect("mux requires power management").mux = Some(MuxSampling {
+            s0,
+            s1,
+            settle_us,
+            channels,
+            axes: [[0; 3]; EVENT_NUM],
+        });
+        self
+    }
+}
+
+impl<'a, const PIN_NUM: usize, const EVENT_NUM: usize> NrfAdc<'a, PIN_NUM, EVENT_NUM> {
+    async fn read_nrf_adc_event(&mut self) -> NrfAdcEvent {
+        if self.power.is_some() {
+            return self.read_powered_event().await;
+        }
+        loop {
+            if self.active_instant == Instant::MIN {
+                self.saadc.sample(&mut self.buf[1]).await;
+                self.active_instant = Instant::now();
+            } else if let Some(light_sleep) = self.light_sleep
+                && self.adc_state == AdcState::LightSleep
+            {
+                embassy_time::Timer::after(light_sleep).await;
+            } else {
+                embassy_time::Timer::after(self.polling_interval).await;
+            }
+
+            if self.active_instant.elapsed().as_millis() > 1200 {
+                self.adc_state = AdcState::LightSleep;
+            }
+
+            if self.event_state == EVENT_NUM as u8 {
+                if self.channel_state != PIN_NUM as u8 {
+                    error!("NrfAdc's pin size and event's required is mismatch");
+                }
+                self.buf_state = !self.buf_state;
+                let buf = if self.buf_state {
+                    &mut self.buf[0]
+                } else {
+                    &mut self.buf[1]
+                };
+                self.saadc.sample(buf).await;
+                for (a, b) in self.buf[0].iter().zip(self.buf[1].iter()) {
+                    if i16::abs(a - b) > 150 {
+                        debug!("ADC Active");
+                        self.adc_state = AdcState::Active;
+                        self.active_instant = Instant::now();
+                        break;
+                    }
+                }
+                self.channel_state = 0;
+                self.event_state = 0;
+            }
+
+            let buf = if self.buf_state { &self.buf[0] } else { &self.buf[1] };
+
+            match self.event_type[self.event_state as usize] {
+                AnalogEventType::Joystick(sz) => {
+                    let mut e = [
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::X,
+                            value: 0,
+                        },
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::Y,
+                            value: 0,
+                        },
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::Z,
+                            value: 0,
+                        },
+                    ];
+                    if sz > 3 || sz == 0 {
+                        error!("Joystick with more than 3 dimensions or empty is not supported. Skip this event");
+                        self.event_state += 1;
+                        continue;
+                    } else {
+                        for i in 0..core::cmp::min(sz, 2) {
+                            e[i as usize].value = (buf[self.channel_state as usize] + i16::MIN / 2).saturating_mul(2);
+                            self.channel_state += 1;
+                        }
+                    }
+                    let device_id = self.event_device_ids[self.event_state as usize];
+                    self.event_state += 1;
+                    return NrfAdcEvent::Pointing(PointingEvent { device_id, axes: e });
+                }
+                AnalogEventType::Battery => {
+                    let battery_adc_value = buf[self.channel_state as usize] as u16;
+                    self.channel_state += 1;
+                    self.event_state += 1;
+                    return NrfAdcEvent::Battery(BatteryAdcEvent(battery_adc_value));
+                }
+            };
+        }
+    }
+
+    async fn read_powered_event(&mut self) -> NrfAdcEvent {
+        loop {
+            if self.event_state == EVENT_NUM as u8 {
+                self.sample_powered().await;
+                self.event_state = 0;
+                self.channel_state = 0;
+            }
+            let event_index = self.event_state as usize;
+            self.event_state += 1;
+            let power = self.power.as_ref().unwrap();
+            match self.event_type[event_index] {
+                AnalogEventType::Joystick(size) => {
+                    let first = self.channel_state as usize;
+                    self.channel_state += size;
+                    if !power.sample_valid {
+                        continue;
+                    }
+                    let mut axes = [
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::X,
+                            value: 0,
+                        },
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::Y,
+                            value: 0,
+                        },
+                        AxisEvent {
+                            typ: AxisValType::Rel,
+                            axis: Axis::Z,
+                            value: 0,
+                        },
+                    ];
+                    for (axis_index, axis) in axes.iter_mut().take(2).enumerate() {
+                        let raw = if let Some(mux) = power.mux.as_ref() {
+                            mux.axes[event_index][axis_index]
+                        } else {
+                            self.buf[0][first + axis_index]
+                        };
+                        axis.value = adc_axis(raw);
+                    }
+                    return NrfAdcEvent::Pointing(PointingEvent {
+                        device_id: self.event_device_ids[event_index],
+                        axes,
+                    });
+                }
+                AnalogEventType::Battery => {
+                    let raw = self.buf[0][self.channel_state as usize];
+                    self.channel_state += 1;
+                    if power.battery_ready {
+                        return NrfAdcEvent::Battery(BatteryAdcEvent(raw.max(0) as u16));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn sample_powered(&mut self) {
+        let has_battery = self.event_type.iter().any(|e| matches!(e, AnalogEventType::Battery));
+        let power = self.power.as_mut().unwrap();
+
+        if power.config.sleep_after_ms > 0 {
+            let epoch = JOYSTICK_WAKE_EPOCH.load(Ordering::Acquire);
+            if epoch != power.wake_epoch {
+                power.wake_epoch = epoch;
+                power.last_activity = Instant::now();
+                if power.sleeping {
+                    power.sleeping = false;
+                    power.boot_done = false;
+                    power.next_sample = Instant::MIN;
+                }
+            }
+            if !power.sleeping
+                && power.idle.idle
+                && power.last_activity.elapsed() >= Duration::from_millis(u64::from(power.config.sleep_after_ms))
+            {
+                power.sleeping = true;
+            }
+            if power.sleeping {
+                // Close the race between clearing an old signal and a new motion event.
+                JOYSTICK_WAKE_SIGNAL.reset();
+                if JOYSTICK_WAKE_EPOCH.load(Ordering::Acquire) == power.wake_epoch {
+                    if has_battery {
+                        let _ = select(embassy_time::Timer::at(power.battery_due), JOYSTICK_WAKE_SIGNAL.wait()).await;
+                    } else {
+                        JOYSTICK_WAKE_SIGNAL.wait().await;
+                    }
+                }
+                let epoch = JOYSTICK_WAKE_EPOCH.load(Ordering::Acquire);
+                if epoch != power.wake_epoch {
+                    power.wake_epoch = epoch;
+                    power.last_activity = Instant::now();
+                    power.sleeping = false;
+                    power.boot_done = false;
+                    power.next_sample = Instant::MIN;
+                } else {
+                    // Keep battery reporting alive without asserting the joystick supply.
+                    power.sample_valid = false;
+                    power.battery_ready = embassy_time::with_timeout(
+                        Duration::from_millis(5), self.saadc.sample(&mut self.buf[0]),
+                    ).await.is_ok();
+                    power.battery_due = Instant::now() + Duration::from_secs(30);
+                    return;
+                }
+            }
+        }
+
+        embassy_time::Timer::at(power.next_sample).await;
+        let config = power.config;
+        power.sample_valid = false;
+        power.battery_ready = false;
+
+        let supply = SupplyGuard { pins: &mut power.pins };
+        for pin in supply.pins.iter_mut().flatten() {
+            pin.set_high();
+        }
+        if !power.boot_done {
+            embassy_time::Timer::after_millis(u64::from(config.boot_settle_ms)).await;
+            power.boot_done = true;
+        }
+
+        let started = Instant::now();
+        // nRF52's core runs at 64 MHz. Interrupts remain enabled; a preemption can extend this wait.
+        cortex_m::asm::delay(config.sample_settle_us.saturating_mul(64));
+        if let Some(mux) = power.mux.as_mut() {
+            // The mux common pin is the last SAADC channel; earlier channels (if
+            // present) are sampled alongside it, including the battery channel.
+            let adc_index = PIN_NUM - 1;
+            let mut axis_index = 0usize;
+            power.sample_valid = true;
+            'scan: for (slot, event) in self.event_type.iter().enumerate() {
+                if let AnalogEventType::Joystick(size) = event {
+                    for axis in 0..usize::from(*size) {
+                        let channel = mux.channels[axis_index];
+                        if channel & 1 == 0 { mux.s0.set_low() } else { mux.s0.set_high() }
+                        if channel & 2 == 0 { mux.s1.set_low() } else { mux.s1.set_high() }
+                        // Allow the analog path to settle before the SAADC acquisition.
+                        cortex_m::asm::delay(mux.settle_us.saturating_mul(64));
+                        if embassy_time::with_timeout(Duration::from_millis(5), self.saadc.sample(&mut self.buf[0]))
+                            .await
+                            .is_err()
+                        {
+                            power.sample_valid = false;
+                            break 'scan;
+                        }
+                        mux.axes[slot][axis] = self.buf[0][adc_index];
+                        axis_index += 1;
+                    }
+                }
+            }
+            mux.s0.set_low();
+            mux.s1.set_low();
+        } else {
+            power.sample_valid = embassy_time::with_timeout(Duration::from_millis(5), self.saadc.sample(&mut self.buf[0]))
+                .await
+                .is_ok();
+        }
+
+        if power.sample_valid {
+            let mut channel = 0usize;
+            let mut centered = true;
+            for (slot, event) in self.event_type.iter().enumerate() {
+                match event {
+                    AnalogEventType::Joystick(size) => {
+                        for axis in 0..2 {
+                            let raw = if let Some(mux) = power.mux.as_ref() {
+                                mux.axes[slot][axis]
+                            } else {
+                                self.buf[0][channel + axis]
+                            };
+                            let value = adc_axis(raw).saturating_add(power.bias[slot][axis]);
+                            centered &= apply_deadzone(value, power.deadzones[slot]) == 0;
+                        }
+                        channel += *size as usize;
+                    }
+                    AnalogEventType::Battery => channel += 1,
+                }
+            }
+            power.idle.observe(Instant::now().as_micros(), centered);
+            if !centered {
+                power.last_activity = Instant::now();
+            }
+        } else {
+            power.idle.observe(Instant::now().as_micros(), false);
+            power.last_activity = Instant::now();
+            if !power.warned {
+                warn!("Joystick ADC sample timed out");
+                power.warned = true;
+            }
+        }
+        // ADC is finished: switch off before any further await.
+        drop(supply);
+
+        // The main SAADC scan already includes the battery channel. Publish that
+        // value every 30 seconds instead of starting a second scan after the
+        // joystick supplies have been switched off. This avoids cancelling or
+        // overlapping a redundant DMA operation while USB is active.
+        if Instant::now() >= power.battery_due && self.event_type.iter().any(|e| matches!(e, AnalogEventType::Battery))
+        {
+            power.battery_ready = power.sample_valid;
+            power.battery_due = Instant::now() + Duration::from_secs(30);
+        }
+        // Skip missed slots, rather than issuing a burst of catch-up power pulses.
+        power.next_sample = (started + Duration::from_micros(config.period_us(power.idle.idle)))
+            .max(Instant::now() + Duration::from_ticks(1));
+    }
+}

@@ -1,0 +1,188 @@
+# Bootloader Configuration (embassy-boot)
+
+[embassy-boot](https://github.com/embassy-rs/embassy/tree/main/embassy-boot) is a library of the embassy framework that is used to build bootloaders.
+RMK supports DFU firmware updates via embassy-boot for **RP2040** and **nRF52840**. An embassy-boot based bootloader splits flash into ACTIVE and DFU slots, providing safe updates with automatic rollback on failure.
+This is an optional feature of RMK, the default bootloaders of the devices can still be used as usual without runtime updates via USB DFU.
+
+:::warning Experimental
+DFU is experimental. Enabling it repartitions your flash, and the partition layout, the `[dfu]`
+options on this page, and the Rust API can change in any release. A firmware built for one partition
+layout cannot be flashed over a bootloader built for another, so treat a board with DFU enabled as
+one you may have to re-flash with a probe.
+:::
+
+An embassy-boot based bootloader for both platforms lives in [rmk-boot](https://github.com/rmk-rs/rmk-boot). RMK integrates with it through a **`memory.x`** file that the bootloader generates: build rmk-boot for your chip and it writes its matching `rmk-memory.x` into the rmk-boot project directory.
+Rename that file to `memory.x` and place it next to your project's `Cargo.toml`, so the firmware and the bootloader agree on the partition layout.
+
+At runtime RMK reads partition offsets from **linker symbols** embedded in `memory.x` — you never compute or hardcode partition addresses yourself.
+
+See the [flashing guide](../user_guide/flash_firmware/use_embassy_boot.mdx) for step-by-step instructions on getting the bootloader and RMK flashed.
+
+## RP2040
+
+Add a `[dfu]` section to your `keyboard.toml` or use the Rust API directly.
+
+import { Tab, Tabs, Rust, Toml } from '@theme'
+
+<Tabs>
+<Tab label={<Toml />}>
+
+```toml title="keyboard.toml"
+[dfu]
+# (Optional) DFU activity LED pin, default "PIN_25".
+led = "PIN_25"
+# led = "none" to omit DFU LED
+
+# (Optional) Unlock keys for dfu_lock (physical matrix positions).
+# Only works with dfu_lock feature enabled in Cargo.toml.
+unlock_keys = [[0, 0], [1, 1]]
+```
+
+</Tab>
+<Tab label={<Rust />}>
+
+```rust title="main.rs"
+let flash = async_flash_wrapper(
+    rmk::dfu::init_flash_from_linkerscript(p.FLASH)
+);
+
+// Optional: assign a DFU activity LED
+let mut dfu_led_processor =
+    rmk::processor::builtin::dfu_led::DfuLedProcessor::new(Output::new(p.PIN_25, Level::Low), false);
+
+// Mark boot as successful (so bootloader doesn't revert on reset)
+rmk::dfu::mark_booted();
+
+// Optional: DFU lock with physical key unlock. Requires the `dfu_lock` Cargo feature.
+let unlock_keys: &[(u8, u8)] = &[(0, 0), (1, 1)];
+let mut dfu_lock = ::rmk::dfu::DfuLock::new(unlock_keys, &keymap);
+// Then add dfu_lock in run_all!()
+	run_all!(
+		// other processors ...
+		dfu_led_processor,
+		dfu_lock,
+	)
+```
+
+</Tab>
+</Tabs>
+
+## nRF52840
+
+Add a `[dfu]` section to your `keyboard.toml` or use the Rust API directly.
+
+<Tabs>
+<Tab label={<Toml />}>
+
+```toml title="keyboard.toml"
+[dfu]
+# (Optional) DFU activity LED pin, default "P0_15".
+led = "P0_15"
+# led = "none" to omit DFU LED
+
+# (Optional) Unlock keys for dfu_lock (physical matrix positions).
+# Only works with dfu_lock feature enabled in Cargo.toml.
+unlock_keys = [[0, 0], [1, 1]]
+```
+
+</Tab>
+<Tab label={<Rust />}>
+
+```rust title="main.rs"
+let flash = async_flash_wrapper(
+    rmk::dfu::init_flash_from_linkerscript(p.NVMC)
+);
+
+// Optional: assign a DFU activity LED
+let mut dfu_led_processor = rmk::processor::builtin::dfu_led::DfuLedProcessor::new(
+    Output::new(p.P0_15, Level::Low, OutputDrive::Standard),
+    false,
+);
+
+// Mark boot as successful (so bootloader doesn't revert on reset)
+rmk::dfu::mark_booted();
+
+// Optional: DFU lock with physical key unlock. Requires the `dfu_lock` Cargo feature.
+let unlock_keys: &[(u8, u8)] = &[(0, 0), (1, 1)];
+let mut dfu_lock = ::rmk::dfu::DfuLock::new(unlock_keys, &keymap);
+
+// Then add dfu_lock in run_all!()
+run_all!(
+	// other processors ...
+	dfu_led_processor,
+	dfu_lock,
+)
+```
+
+</Tab>
+</Tabs>
+
+## Partition layout
+
+The bootloader divides flash into regions. All offsets and sizes come from linker symbols in the `memory.x` file from rmk-boot. The default layout with rmk-boot (2MB RP2040, 32K storage) is:
+
+| Region          | Offset         | Size                                 |
+|-----------------|----------------|--------------------------------------|
+| Bootloader(s)   | `0x0000000`    | 24 KB                                |
+| Boot state      | `0x6000`       | 4 KB                                 |
+| Active firmware | `0x7000`       | `(flash_size - 28K (Bootloader) - 32K (Storage) - 4K (1 Page)) / 2`  |
+| DFU download    | follows active | `active_size + 4K (1 Page)`                   |
+| Storage         | follows DFU    | 32 KB (8 sectors × 4K)               |
+
+The DFU partition size follows embassy-boot guidelines, the additional page is used for status information during flashing.
+
+The `[dfu]` section is **optional** and configures only DFU behaviour (LED, unlock keys). Partition offsets are read at link time from `memory.x` — you do **not** set `state_offset`, `dfu_offset`, or `flash_size` in `keyboard.toml`.
+
+## Custom bootloader
+
+If you built your own embassy-boot bootloader, add these eight symbols with matching values to your `memory.x` (all values are flash-relative offsets):
+
+```text
+__bootloader_state_start   = 0x6000;   /* boot state start */
+__bootloader_state_end     = 0x7000;   /* boot state end */
+__bootloader_active_start  = 0x7000;   /* active (booted) slot start */
+__bootloader_active_end    = 0xF3000;  /* active (booted) slot end */
+__bootloader_dfu_start     = 0xF3000;  /* DFU download slot start */
+__bootloader_dfu_end       = 0x1E0000; /* DFU download slot end */
+__bootloader_storage_start = 0x1E0000; /* storage partition start */
+__bootloader_storage_end   = 0x200000; /* storage partition end */
+```
+
+The `__bootloader_active_*`, `__bootloader_state_*` and `__bootloader_dfu_*` symbols are the same ones embassy-boot's `from_linkerfile_blocking()` reads — only `__bootloader_storage_*` is an RMK extension.
+
+Make sure `FLASH : ORIGIN` in your `MEMORY` block starts at your ACTIVE partition. RMK's `init_flash_from_linkerscript()` picks up the symbols at runtime.
+
+## DFU LED (optional)
+
+A GPIO pin for the DFU LED.
+
+| Platform | Default LED pin | Example configuration |
+|----------|----------------|----------------------|
+| RP2040   | `PIN_25`       | `led = "PIN_25"`     |
+| nRF52840 | `P0_15`        | `led = "P0_15"`      |
+
+See the [LED behavior table](../user_guide/flash_firmware/use_embassy_boot.mdx#led-behavior-during-dfu-transfer-optional) for the full state machine.
+
+## DFU lock (optional, feature `dfu_lock`)
+
+Physical key positions that unlock DFU firmware downloads. Requires the `dfu_lock` Cargo feature. Keys are identified by matrix position `(row, col)`, not by keycode.
+
+See the [DFU lock section](../user_guide/flash_firmware/use_embassy_boot.mdx#unlocking-dfu-optional-dfu_lock) for the unlock workflow.
+
+::: tip
+Choose keys that are easy to press simultaneously but not commonly pressed together accidentally.
+:::
+
+## Split peripheral firmware (optional, feature `dfu_split`)
+
+With the `dfu_split` Cargo feature, the central can flash its peripherals over the split link. Point each `[[split.peripheral]]` at the peripheral's firmware binary and RMK embeds it with `include_bytes!`:
+
+```toml title="keyboard.toml"
+[[split.peripheral]]
+# Path relative to your project's Cargo.toml
+firmware = "./peripheral.bin"
+# "MatchHash" (default): flash only when the peripheral's firmware differs; "force": flash at every start
+update_policy = "MatchHash"
+```
+
+See [Split peripheral updates](../user_guide/flash_firmware/use_embassy_boot.mdx#split-peripheral-updates-dfu_split) for the update flow, the passthrough path and the peripheral firmware requirements.

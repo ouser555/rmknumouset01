@@ -1,0 +1,11 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# runner = "probe-rs run --chip nrf54lm20a"
+runner = "./run.sh"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[env]
+DEFMT_LOG = "debug"
+KEYBOARD_TOML_PATH = { value = "keyboard.toml", relative = true }
+                      

@@ -1,0 +1,21 @@
+[
+  "matrix",
+  "layers",
+  "wireless",
+  "configuration",
+  "low_power",
+  "split_keyboard",
+  "dongle",
+  "vial_support",
+  "rynk",
+  "usb_logging",
+  "storage",
+  "use_rust_api",
+  "processor",
+  "event",
+  "input_device",
+  "display",
+  "steno",
+  "binary_size_optimization",
+  "watchdog"
+]
