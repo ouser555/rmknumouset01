@@ -1,0 +1,167 @@
+[keyboard]
+name = "rmknumouse"
+product_name = "rmknumouse"
+vendor_id = 0x4c4b
+product_id = 0x4643
+manufacturer = "RMK"
+chip = "nrf52840"
+
+[matrix]
+matrix_type = "direct_pin"
+direct_pin_low_active = true
+direct_pins = [
+    ["P1_13", "P1_11", "P0_10", "_"],
+    ["_", "_", "_", "_"],
+    ["_", "_", "_", "_"],
+]
+
+[layout]
+rows = 3
+cols = 4
+map = """
+(e,0)
+(0,0) (0,1) (0,2)
+(1,0) (1,1) (1,2) (1,3)
+(2,0) (2,1) (2,2) (2,3)
+"""
+
+[keymap]
+layers = 2
+
+[event.action]
+subs = 1
+
+# Two joystick processors and the PMW3610 processor are permanent subscribers.
+# BLE advertising adds one temporary wake subscriber after its 300 s timeout.
+[event.pointing]
+subs = 4
+
+[[keymap.layer]]
+keys = """
+User7 User8 C
+Up Left Right Down
+Up Left Right Down
+"""
+encoders = [["AudioVolUp", "AudioVolDown"]]
+
+[[keymap.layer]]
+name = "SpaceMouse"
+keys = """
+_ _ _
+_ _ _ _
+_ _ _ _
+"""
+encoders = [["_", "_"]]
+
+[[input_device.joystick]]
+name = "j1"
+id = 0
+pin_x = "P0_31"
+pin_y = "P0_31"
+pin_z = "_"
+power_pin = "P1_15"
+# HT4051ARZ: J1 X=X2, J1 Y=X1, J2 X=X0, J2 Y=X3.
+# Common X goes to P0_31; A/S0=P0_02, B/S1=P0_29, C/S2=GND.
+# ENABLE and VEE are grounded; the mux VCC is always powered.
+mux_s0 = "P0_02"
+mux_s1 = "P0_29"
+mux_channels = [2, 1, 0, 3]
+mux_settle_us = 3
+# Initial values from the previous board; calibrate center/direction on hardware.
+transform = [[80, 0], [0, 80]]
+bias = [29130, 29365]
+resolution = 6
+polling_rate_hz = 50
+idle_polling_rate_hz = 5
+sample_settle_us = 3
+boot_settle_ms = 2
+# Set to 0 to keep the previous 50 Hz / 5 Hz periodic sampling forever.
+sleep_after_ms = 60000
+# PMW3610 device ID; real motion wakes both joysticks.
+wake_device_id = 1
+deadzone = 400
+# This revision switches off immediately after sampling; no duty parameters.
+
+[[input_device.joystick]]
+name = "j2"
+id = 2
+pin_x = "P0_31"
+pin_y = "P0_31"
+pin_z = "_"
+# J1 and J2 share the P1_15 supply; P0_02 selects the mux and P0_24 is PMW3610 motion.
+# Initial calibration; refine bias/transform from J2 measurements if needed.
+transform = [[80, 0], [0, 80]]
+bias = [29130, 29365]
+resolution = 6
+polling_rate_hz = 50
+idle_polling_rate_hz = 5
+sample_settle_us = 3
+boot_settle_ms = 2
+deadzone = 400
+
+# nice!nano only
+# Enable the switched EXT_VCC rail that powers PMW3610 and encoder pull-ups.
+#[[output]]
+#pin = "P0_13"
+#initial_state_active = true
+#low_active = false
+
+# Keep the output on P0_15 low at startup.
+[[output]]
+pin = "P0_15"
+initial_state_active = false
+low_active = false
+
+[[input_device.encoder]]
+pin_a = "P1_00"
+pin_b = "P0_11"
+#internal_pullup = true
+phase = "default"
+reverse = false
+debounce_ms = 5
+
+[[input_device.pmw3610]]
+name = "trackball"
+id = 1
+spi.instance = "bitbang0"
+spi.mosi = "P0_17"
+spi.miso = "P0_17"
+spi.sck = "P0_20"
+spi.cs = "P0_22"
+motion = "P0_24"
+report_hz = 60
+force_awake = false
+smart_mode = false
+cpi = 800
+
+[ble]
+enabled = true
+# nice!nano v2 battery via internal VDDH ADC.
+battery_adc_pin = "vddh"
+
+[display]
+driver = "ssd1306"
+size = "128x32"
+rotation = 270
+renderer = "crate::mode_oled_renderer::ModeOledRenderer"
+timeout_ms = 3000
+# nice!nano v2 external VCC on P0_13 is enabled at high level.
+# Keep the shared OLED / sensor rail enabled throughout operation.
+# Timeout sends only the SSD1306 display-off command.
+power_off = "display"
+power_pin = "P0_13"
+power_pin_low_active = false
+power_on_delay_ms = 2000
+
+[display.protocol.i2c]
+instance = "TWISPI0"
+sda = "P0_06"
+scl = "P0_08"
+address = 0x3C
+
+# nRF52840 regulator settings retained from the previous board; verify on nice!nano.
+# REG0 high-voltage DC/DC remains disabled.
+[chip.nrf52840]
+#dcdc_reg0 = true
+dcdc_reg0 = false
+dcdc_reg1 = true
